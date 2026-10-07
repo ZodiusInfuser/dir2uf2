@@ -4,8 +4,11 @@ import os
 import sys
 import math
 import argparse
+import shutil
 import struct
 import pathlib
+import subprocess
+import tempfile
 import littlefs
 from py_decl import PyDecl, UF2Reader
 
@@ -179,6 +182,18 @@ def copy_manifest_or_dir(target, source_dir):
             copy_files(target, source_dir.glob(item), source_dir)
 
 
+class StagingDir:
+    """A host directory standing in for a filesystem, so copy_manifest_or_dir can fill it."""
+    def __init__(self, root):
+        self.root = root
+
+    def makedirs(self, path, exist_ok=False):
+        (self.root / path).mkdir(parents=True, exist_ok=exist_ok)
+
+    def open(self, path, mode):
+        return open(self.root / path, mode)
+
+
 def lfs_filesystem(args):
     lfs = littlefs.LittleFS(
         block_size=args.block_size,
@@ -212,6 +227,44 @@ def lfs_filesystem(args):
     return lfs.context.buffer
 
 
+def fat_filesystem(args):
+    # ffsmake formats with MicroPython's own oofatfs, so the volume matches what VfsFat.mkfs
+    # would make on the board: https://github.com/gadgetoid/ffsmake
+    ffsmake = shutil.which(args.ffsmake)
+    if ffsmake is None:
+        raise RuntimeError(f"Could not find ffsmake ({args.ffsmake}), needed for --fs-type fat!")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        staging = pathlib.Path(temp_dir) / "root"
+        staging.mkdir()
+        copy_manifest_or_dir(StagingDir(staging), args.source_dir)
+
+        fat_bin = pathlib.Path(temp_dir) / "fat.bin"
+        command = [
+            ffsmake,
+            f"--sector-size={args.block_size}",
+            f"--sector-count={block_count}",
+            "--directory", str(staging),
+            "--output", str(fat_bin),
+        ]
+        if args.fs_label is not None:
+            command.append(f"--label={args.fs_label}")
+        if not args.verbose:
+            command.append("--quiet")
+        # ffsmake gives its own reason on stderr, such as two names differing only in case
+        if subprocess.run(command).returncode != 0:
+            raise RuntimeError("ffsmake could not build the FAT filesystem!")
+
+        # ffsmake writes only up to the last sector it used
+        fat_data = fat_bin.read_bytes()
+
+    if args.fs_compact:
+        print(f"Compacting FAT to {len(fat_data) / 1024}K.")
+        return fat_data
+
+    return fat_data.ljust(block_count * args.block_size, b"\xff")
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--filename", type=pathlib.Path, default="filesystem", help="Output filename.")
 parser.add_argument("--fs-start", type=lambda value: int(value, 0), default=None, help="Filesystem address, decimal or 0x hex.")
@@ -219,10 +272,12 @@ parser.add_argument("--fs-size", type=lambda value: int(value, 0), default=None,
 parser.add_argument("--fs-reserve", type=int, default=0, help="Size (in bytes) to reserve for other functions.")
 parser.add_argument("--fs-compact", action="store_true", help="Compact filesystem to used blocks.")
 parser.add_argument("--fs-overwrite", action="store_true", help="Replace an existing filesystem in the UF2.")
-parser.add_argument("--fs-type", choices=("lfs",), default="lfs", help="Filesystem type.")
+parser.add_argument("--fs-type", choices=("lfs", "fat"), default="lfs", help="Filesystem type.")
+parser.add_argument("--fs-label", default=None, help="FAT volume label.")
+parser.add_argument("--ffsmake", default="ffsmake", help="ffsmake executable, for --fs-type fat.")
 args_fs_blockdev = parser.add_argument("--fs-blockdev", default="MicroPython", help="Prefer a specific block device for size auto-detection.")
 parser.add_argument("--sparse", action="store_true", help="Skip padding between app and filesystem.")
-parser.add_argument("--block-size", type=int, default=4096, help="LFS block size in Kb.")
+parser.add_argument("--block-size", type=int, default=4096, help="LFS block size, or FAT sector size, in bytes.")
 parser.add_argument("--read-size", type=int, default=256, help="LFS read size in Kb.")
 parser.add_argument("--prog-size", type=int, default=32, help="LFS prog size in Kb.")
 parser.add_argument("--manifest", default=None, help="Manifest to filter copied files.")
@@ -272,23 +327,25 @@ if block_count * args.block_size != args.fs_size:
 output_filename = args.filename
 
 
-# Build a LittleFS filesystem by default if a directory is supplied
+# Build a filesystem, LittleFS by default, if a directory is supplied
 if args.source_dir.is_dir():
     if args.fs_type == "lfs":
-        lfs_data = lfs_filesystem(args)
+        fs_data = lfs_filesystem(args)
+    elif args.fs_type == "fat":
+        fs_data = fat_filesystem(args)
 
     # Write a .bin with *just* the filesystem
     bin_filename = output_filename.with_suffix(".bin")
 
     with open(bin_filename, "wb") as f:
-        f.write(lfs_data)
+        f.write(fs_data)
 
     print(f"Written: {bin_filename}")
 
 elif args.source_dir.is_file():  # Open an existing filesystem binary
     print(f"Opening source file: {args.source_dir}")
-    lfs_data = open(args.source_dir, "rb").read()
-    if (src_size := len(lfs_data)) > args.fs_size:
+    fs_data = open(args.source_dir, "rb").read()
+    if (src_size := len(fs_data)) > args.fs_size:
         raise RuntimeError(f"Source file too big for Block Device {args.fs_blockdev} ({print_size(src_size)} > {print_size(args.fs_size)})!")
     else:
         print(f"Source file fits in Block Device {args.fs_blockdev} ({print_size(src_size)} <= {print_size(args.fs_size)})!")
@@ -300,7 +357,7 @@ else:
 uf2_filename = output_filename.with_suffix(".uf2")
 
 with open(uf2_filename, "wb") as f:
-    for block in bin_to_uf2([(args.fs_start, lfs_data, FAMILY_ID_RP2040, 0x2000)]):
+    for block in bin_to_uf2([(args.fs_start, fs_data, FAMILY_ID_RP2040, 0x2000)]):
         f.write(block)
 
 print(f"Written: {uf2_filename}")
@@ -341,7 +398,7 @@ if args.append_to is not None:
                 raise RuntimeError(f"Trying to append over an existing filesystem: {args.fs_blockdev}!")
 
             # If the section family ID matches RP2040 or RP2350 then append
-            # our littlefs filesystem to that specific block.
+            # our filesystem to that specific block.
             if family_id in (FAMILY_ID_RP2040, FAMILY_ID_RP2350):
                 if args.sparse:
                     print("Building sparse uf2.")
@@ -365,10 +422,10 @@ if args.append_to is not None:
                     fs_start += start_addr
                     fs_padding = fs_start - args.fs_start
 
-                    print(f"E14: Padding filesystem data from {len(lfs_data)} to {len(lfs_data) + fs_padding}")
-                    lfs_data = lfs_data.rjust(len(lfs_data) + fs_padding, b"\xff")
+                    print(f"E14: Padding filesystem data from {len(fs_data)} to {len(fs_data) + fs_padding}")
+                    fs_data = fs_data.rjust(len(fs_data) + fs_padding, b"\xff")
 
-                    block_sections[fs_start] = lfs_data
+                    block_sections[fs_start] = fs_data
 
                     # Add our filesystem to the flash section
                     print(f"Output sections: Firmware: 0x{start_addr:08x} Filesystem: 0x{fs_start:08x}")
@@ -393,7 +450,7 @@ if args.append_to is not None:
                     # Concat our filesystem onto the data
                     output_sections.append((
                         start_addr,
-                        block_data + lfs_data,
+                        block_data + fs_data,
                         family_id,
                         flags
                     ))

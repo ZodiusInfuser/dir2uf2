@@ -61,3 +61,26 @@ Compact filesystem for a (sometimes *much*) smaller .uf2:
 ```
 ./dir2uf2 --fs-compact ~/Downloads/enviro-0.0.5
 ```
+
+## FAT filesystems
+
+`--fs-type fat` builds a FAT volume, for a region the board exposes over USB mass storage, using
+[ffsmake](https://github.com/gadgetoid/ffsmake). ffsmake formats with MicroPython's own oofatfs, so
+the volume matches what `vfs.VfsFat.mkfs` makes on the board. Build ffsmake first, and point
+`--ffsmake` at it if it is not on `PATH`.
+
+`--block-size` is the sector size, which must match the block device's (4096 for rp2 flash).
+`--fs-label` sets the volume label. `--manifest` and `--fs-compact` work as they do for LittleFS.
+
+A region that no block device in the firmware declares is given by address and size, which accept
+hex:
+
+```
+./dir2uf2 --fs-type fat --fs-label FX --fs-compact --sparse \
+    --fs-start 0x10200000 --fs-size 0x6a0000 \
+    --append-to firmware.uf2 --filename drive ~/my-drive
+```
+
+Appending a FAT volume and a LittleFS filesystem to one .uf2 takes two runs, the second appending to
+the first's output. Without `--sparse`, append the lower region first: padding runs from the end of
+the firmware to the region being appended, so a later run below an earlier one is refused.
