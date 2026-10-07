@@ -214,8 +214,8 @@ def lfs_filesystem(args):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--filename", type=pathlib.Path, default="filesystem", help="Output filename.")
-parser.add_argument("--fs-start", type=int, default=None, help="Filesystem offset.")
-parser.add_argument("--fs-size", type=int, default=None, help="Filesystem size.")
+parser.add_argument("--fs-start", type=lambda value: int(value, 0), default=None, help="Filesystem address, decimal or 0x hex.")
+parser.add_argument("--fs-size", type=lambda value: int(value, 0), default=None, help="Filesystem size in bytes, decimal or 0x hex.")
 parser.add_argument("--fs-reserve", type=int, default=0, help="Size (in bytes) to reserve for other functions.")
 parser.add_argument("--fs-compact", action="store_true", help="Compact filesystem to used blocks.")
 parser.add_argument("--fs-overwrite", action="store_true", help="Replace an existing filesystem in the UF2.")
